@@ -3,171 +3,243 @@ from discord.ext import commands
 import os
 import json
 import asyncio
+import traceback
 from openai import AsyncOpenAI
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# Configuration
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 XAI_API_KEY = os.getenv("XAI_API_KEY")
-OWNER_IDS = [int(id.strip()) for id in os.getenv("OWNER_IDS", "").split(",") if id.strip()]  # Comma-separated Discord user IDs
+OWNER_IDS = [int(i.strip()) for i in os.getenv("OWNER_IDS", "").split(",") if i.strip()]
+MODEL = os.getenv("GROK_MODEL", "grok-4")
 PREFIX = ":"
 
-# Initialize clients
 intents = discord.Intents.default()
 intents.message_content = True
-intents.members = True  # For member actions if needed
+intents.members = True
 bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
 
 ai_client = AsyncOpenAI(
     api_key=XAI_API_KEY,
-    base_url="https://api.x.ai/v1"
+    base_url="https://api.x.ai/v1",
 )
 
-# Define tools the AI can call
 TOOLS = [
     {
         "type": "function",
         "function": {
             "name": "send_message",
-            "description": "Send a message to the current channel or a specified channel.",
+            "description": "Send a message in the current channel or another channel.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "content": {"type": "string", "description": "The message content to send"},
-                    "channel_id": {"type": "string", "description": "Optional channel ID to send to (defaults to current)"}
+                    "content": {"type": "string"},
+                    "channel_id": {"type": "string"},
                 },
-                "required": ["content"]
-            }
-        }
+                "required": ["content"],
+            },
+        },
     },
     {
         "type": "function",
         "function": {
             "name": "reply_to_message",
-            "description": "Reply to the user's message.",
+            "description": "Reply to the user's command message.",
             "parameters": {
                 "type": "object",
-                "properties": {
-                    "content": {"type": "string", "description": "The reply content"}
-                },
-                "required": ["content"]
-            }
-        }
+                "properties": {"content": {"type": "string"}},
+                "required": ["content"],
+            },
+        },
     },
     {
         "type": "function",
         "function": {
             "name": "delete_recent_messages",
-            "description": "Delete a number of recent messages in the channel (requires Manage Messages permission).",
+            "description": "Delete recent messages in the current channel.",
             "parameters": {
                 "type": "object",
-                "properties": {
-                    "count": {"type": "integer", "description": "Number of messages to delete (1-100)"}
-                },
-                "required": ["count"]
-            }
-        }
+                "properties": {"count": {"type": "integer"}},
+                "required": ["count"],
+            },
+        },
     },
     {
         "type": "function",
         "function": {
             "name": "create_text_channel",
-            "description": "Create a new text channel in the server.",
+            "description": "Create a text channel in the current server.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "name": {"type": "string", "description": "Name of the channel"},
-                    "topic": {"type": "string", "description": "Optional topic/description"}
+                    "name": {"type": "string"},
+                    "topic": {"type": "string"},
                 },
-                "required": ["name"]
-            }
-        }
+                "required": ["name"],
+            },
+        },
     },
     {
         "type": "function",
         "function": {
             "name": "kick_member",
-            "description": "Kick a member from the server (requires Kick Members permission). Use user ID or mention.",
+            "description": "Kick a member by user id.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "user_id": {"type": "string", "description": "Discord user ID of the member to kick"},
-                    "reason": {"type": "string", "description": "Reason for the kick"}
+                    "user_id": {"type": "string"},
+                    "reason": {"type": "string"},
                 },
-                "required": ["user_id"]
-            }
-        }
-    }
+                "required": ["user_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_code",
+            "description": (
+                "Run async Python against the live Discord bot when no other tool fits. "
+                "Use this for channel permissions, hiding channels, roles, timeouts, bans, "
+                "nicknames, slowmode, or anything else discord.py can do. "
+                "The code is the body of an async function. Use await. "
+                "Names already in scope: message, channel, guild, author, bot, discord, asyncio. "
+                "Return a short status string. Never claim a capability is missing if this tool exists."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "code": {
+                        "type": "string",
+                        "description": "Python statements forming the body of an async function. Must use await for Discord calls.",
+                    }
+                },
+                "required": ["code"],
+            },
+        },
+    },
 ]
 
-SYSTEM_PROMPT = """You are an AI-powered Discord bot. The user gives you natural language instructions starting with ':'.
-Interpret the instruction and either respond conversationally or use the available tools to perform Discord actions.
-Be helpful, concise, and execute what the user asks when possible.
-Only use tools when an action is needed. Always confirm actions if destructive.
-Current context: you are responding in a Discord server/channel."""
+SYSTEM_PROMPT = """You control a Discord bot. The user message is an order. Do it.
 
-async def execute_tool(tool_name: str, arguments: dict, message: discord.Message):
-    """Execute the tool called by the AI and return the result as a string."""
+Rules:
+- Prefer the named tools when they fit.
+- If they do not fit, call run_code. Do not tell the user you lack a tool.
+- run_code is the body of an async function. Use await. Return a short status string.
+- Names in scope: message, channel, guild, author, bot, discord, asyncio.
+- channel.id is the current channel. guild.default_role is @everyone.
+- To hide a channel from @everyone:
+    target = bot.get_channel(CHANNEL_ID) or channel
+    await target.set_permissions(guild.default_role, view_channel=False)
+    return "Hid the channel from @everyone"
+- To show it again: await target.set_permissions(guild.default_role, view_channel=True)
+- If a tool result is an error, call run_code again with a fix. Do not give up after one failure.
+- After the action succeeds, reply with one short confirmation. Do not dump the code.
+"""
+
+
+def _assistant_message(response_message):
+    payload = {
+        "role": "assistant",
+        "content": response_message.content or "",
+    }
+    if response_message.tool_calls:
+        payload["tool_calls"] = [
+            {
+                "id": call.id,
+                "type": "function",
+                "function": {
+                    "name": call.function.name,
+                    "arguments": call.function.arguments,
+                },
+            }
+            for call in response_message.tool_calls
+        ]
+    return payload
+
+
+async def run_user_code(code: str, message: discord.Message) -> str:
+    indented = "\n".join("    " + line if line.strip() else "" for line in code.splitlines())
+    if not indented.strip():
+        return "Code error: empty code"
+    source = "async def __user_action():\n" + indented + "\n"
+    namespace = {
+        "discord": discord,
+        "bot": bot,
+        "message": message,
+        "channel": message.channel,
+        "guild": message.guild,
+        "author": message.author,
+        "asyncio": asyncio,
+    }
+    try:
+        exec(source, namespace, namespace)
+        result = await asyncio.wait_for(namespace["__user_action"](), timeout=25)
+        return str(result) if result is not None else "Code ran successfully."
+    except Exception:
+        return "Code error:\n" + traceback.format_exc(limit=6)
+
+
+async def execute_tool(tool_name: str, arguments: dict, message: discord.Message) -> str:
     try:
         if tool_name == "send_message":
-            content = arguments.get("content")
-            channel_id = arguments.get("channel_id")
+            content = arguments.get("content") or ""
             channel = message.channel
+            channel_id = arguments.get("channel_id")
             if channel_id:
                 channel = bot.get_channel(int(channel_id)) or await bot.fetch_channel(int(channel_id))
-            if channel:
-                await channel.send(content)
-                return f"Sent message: {content}"
-            return "Failed to find channel."
+            if not channel:
+                return "Failed to find channel."
+            await channel.send(content)
+            return f"Sent message in #{getattr(channel, 'name', channel.id)}."
 
-        elif tool_name == "reply_to_message":
-            content = arguments.get("content")
-            await message.reply(content)
-            return f"Replied: {content}"
+        if tool_name == "reply_to_message":
+            await message.reply(arguments.get("content") or "")
+            return "Replied."
 
-        elif tool_name == "delete_recent_messages":
-            count = min(max(arguments.get("count", 1), 1), 100)
+        if tool_name == "delete_recent_messages":
+            count = min(max(int(arguments.get("count", 1)), 1), 100)
             deleted = await message.channel.purge(limit=count)
             return f"Deleted {len(deleted)} messages."
 
-        elif tool_name == "create_text_channel":
-            name = arguments.get("name")
-            topic = arguments.get("topic")
-            if message.guild:
-                channel = await message.guild.create_text_channel(name, topic=topic)
-                return f"Created channel #{channel.name}"
-            return "Not in a guild."
+        if tool_name == "create_text_channel":
+            if not message.guild:
+                return "Not in a server."
+            created = await message.guild.create_text_channel(
+                arguments["name"], topic=arguments.get("topic")
+            )
+            return f"Created #{created.name} ({created.id})."
 
-        elif tool_name == "kick_member":
-            user_id = arguments.get("user_id")
-            reason = arguments.get("reason", "No reason provided")
-            if message.guild:
-                member = message.guild.get_member(int(user_id))
-                if member:
-                    await member.kick(reason=reason)
-                    return f"Kicked {member.display_name}."
-                return "Member not found."
-            return "Not in a guild."
+        if tool_name == "kick_member":
+            if not message.guild:
+                return "Not in a server."
+            member = message.guild.get_member(int(arguments["user_id"]))
+            if member is None:
+                member = await message.guild.fetch_member(int(arguments["user_id"]))
+            await member.kick(reason=arguments.get("reason") or "No reason provided")
+            return f"Kicked {member}."
 
-        else:
-            return f"Unknown tool: {tool_name}"
-    except Exception as e:
-        return f"Error executing {tool_name}: {str(e)}"
+        if tool_name == "run_code":
+            return await run_user_code(arguments.get("code") or "", message)
+
+        return f"Unknown tool: {tool_name}"
+    except Exception:
+        return f"Error executing {tool_name}:\n" + traceback.format_exc(limit=4)
+
 
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
-    print("------")
-    await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name="for :commands"))
+    await bot.change_presence(
+        activity=discord.Activity(type=discord.ActivityType.watching, name="for :commands")
+    )
+
 
 @bot.event
 async def on_message(message: discord.Message):
     if message.author == bot.user or message.author.bot:
         return
-
-    # Only respond to prefix and authorized owners (or empty list = anyone)
     if not message.content.startswith(PREFIX):
         return
     if OWNER_IDS and message.author.id not in OWNER_IDS:
@@ -176,62 +248,64 @@ async def on_message(message: discord.Message):
 
     instruction = message.content[len(PREFIX):].strip()
     if not instruction:
-        await message.reply("Tell me what to do after the colon!")
+        await message.reply("Tell me what to do after the colon.")
         return
 
     async with message.channel.typing():
         try:
-            messages = [
+            history = [
                 {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": f"Instruction: {instruction}\nContext: Channel '{message.channel.name}' in guild '{message.guild.name if message.guild else 'DM'}'."}
+                {
+                    "role": "user",
+                    "content": (
+                        f"Instruction: {instruction}\n"
+                        f"channel_id: {message.channel.id}\n"
+                        f"channel_name: {getattr(message.channel, 'name', 'DM')}\n"
+                        f"guild_id: {message.guild.id if message.guild else 'none'}\n"
+                        f"guild_name: {message.guild.name if message.guild else 'DM'}\n"
+                        f"author_id: {message.author.id}"
+                    ),
+                },
             ]
 
-            response = await ai_client.chat.completions.create(
-                model="grok-4",  # or "grok-3" / "grok-beta" depending on availability
-                messages=messages,
-                tools=TOOLS,
-                tool_choice="auto",
-                max_tokens=1000,
-                temperature=0.7
-            )
-
-            response_message = response.choices[0].message
-
-            # Handle tool calls
-            if response_message.tool_calls:
-                # Append the assistant's tool call message
-                messages.append(response_message)
-
-                for tool_call in response_message.tool_calls:
-                    function_name = tool_call.function.name
-                    function_args = json.loads(tool_call.function.arguments)
-                    result = await execute_tool(function_name, function_args, message)
-
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tool_call.id,
-                        "content": result
-                    })
-
-                # Get final response after tools
-                final_response = await ai_client.chat.completions.create(
-                    model="grok-4",
-                    messages=messages,
-                    max_tokens=500
+            final_text = "Done."
+            for _ in range(4):
+                response = await ai_client.chat.completions.create(
+                    model=MODEL,
+                    messages=history,
+                    tools=TOOLS,
+                    tool_choice="auto",
+                    max_tokens=1200,
+                    temperature=0.2,
                 )
-                final_content = final_response.choices[0].message.content or "Done."
-                await message.reply(final_content)
+                response_message = response.choices[0].message
+                if not response_message.tool_calls:
+                    final_text = response_message.content or "Done."
+                    break
+
+                history.append(_assistant_message(response_message))
+                for tool_call in response_message.tool_calls:
+                    args = json.loads(tool_call.function.arguments or "{}")
+                    result = await execute_tool(tool_call.function.name, args, message)
+                    history.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "content": result[:3500],
+                        }
+                    )
             else:
-                # Direct text response
-                content = response_message.content or "I understood but have nothing to say."
-                await message.reply(content)
+                final_text = "Stopped after several attempts. Check the bot logs."
 
+            if len(final_text) > 1900:
+                final_text = final_text[:1900] + "…"
+            await message.reply(final_text)
         except Exception as e:
-            await message.reply(f"Error: {str(e)}")
+            await message.reply(f"Error: {e}")
 
-# Run the bot
+
 if __name__ == "__main__":
     if not DISCORD_TOKEN or not XAI_API_KEY:
-        print("Missing DISCORD_TOKEN or XAI_API_KEY in .env")
+        print("Missing DISCORD_TOKEN or XAI_API_KEY")
     else:
         bot.run(DISCORD_TOKEN)
